@@ -1,0 +1,20 @@
+# python-miio declares a dependency on "netifaces", which needs a C++ compiler to build on Windows.
+# Install it without dependencies and add the rest by hand (see README):
+#   pip install --no-deps python-miio==0.5.12
+#   pip install -r requirements.txt
+python-miio==0.5.12
+android_backup
+appdirs
+attrs
+click
+construct==2.10.70
+croniter
+cryptography
+defusedxml
+micloud
+pytz
+PyYAML
+tqdm
+zeroconf
+soundcard==0.4.6
+numpy

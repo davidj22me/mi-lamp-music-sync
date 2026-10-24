@@ -1,0 +1,15 @@
+# Secrets and local state - never commit these
+.env
+settings.json
+.music_sync.lock
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller output (ship the .exe via GitHub Releases instead)
+build/
+dist/
+*.spec
