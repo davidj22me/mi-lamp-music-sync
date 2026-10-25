@@ -13,3 +13,6 @@ venv/
 build/
 dist/
 *.spec
+
+# Personal safety limits (contains your measured update rate); lamp_config.example.ini is the shipped default
+lamp_config.ini

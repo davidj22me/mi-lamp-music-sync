@@ -2,62 +2,68 @@
 Mi Bedside Lamp 2 - music reactive lighting (engine + command line).
 
 The window app (app.py / MiLampSync.exe) uses the same Engine. To use the CLI:
-    python music_sync.py                 # runs until you quit (max 120 min by default)
-    python music_sync.py --minutes 30    # auto-stop after 30 minutes
-    python music_sync.py --mode classic  # bass->brightness, pitch->hue instead of beat color steps
-    python music_sync.py --blink every   # dip to dark on each beat, new color comes up
+    python music_sync.py                    # runs until you quit (max 120 min by default)
+    python music_sync.py --max-runtime 30   # auto-stop after 30 minutes
+    python music_sync.py --gentle           # slower, dimmer, no blinking
+    python music_sync.py --mode classic     # bass->brightness, pitch->hue instead of beat color steps
+    python music_sync.py --blink every      # opt-in: dip to dark on each beat, new color comes up
     python music_sync.py --blink alternate  # same, every other beat
-    python music_sync.py --dry-run       # analyse audio and print values, never touch the lamp
+    python music_sync.py --restore warm     # on exit set warm white instead of the previous state
+    python music_sync.py --off-at-exit      # turn the lamp off on exit (default: leave it on)
+    python music_sync.py --dry-run          # analyse audio and print values, never touch the lamp
 
 Stop it any time with:  q  (or Esc)  or  Ctrl+C.
 
-Guardrails:
+Safety limits (brightness cap, update rate, flash rate, ...) live in lamp_config.ini and are enforced
+in lamp_safety.py. Other guardrails:
   * Foreground only. No background service, no autostart, no scheduled task.
   * One instance at a time (lock file). A second copy refuses to start.
-  * Hard runtime cap (--minutes, default 120) so it can never loop forever.
-  * Stops by itself after repeated lamp errors, or after a long stretch of silence.
-  * On exit (quit, Ctrl+C, error, window closed) the lamp is restored to the state it
-    had before the script started.
+  * Hard runtime cap, plus auto-stop after a long stretch of silence or repeated lamp errors.
+  * On exit (quit, Ctrl+C, error, window closed) the lamp is restored; it is never switched off
+    unless --off-at-exit is given.
   * Audio is only *read* through WASAPI loopback (a copy of the output signal). It never
     changes your volume, device, or what you hear.
 """
 import argparse
 import colorsys
 import os
+import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import soundcard as sc
 
+import lamp_safety as ls
+
 # When packaged with PyInstaller the .env / lock / settings live next to the .exe.
-HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+HERE = ls.HERE
 LOCK_PATH = os.path.join(HERE, ".music_sync.lock")
 ENV_PATH = os.path.join(HERE, ".env")
 
-# ---- tuning ---------------------------------------------------------------
+# ---- audio / look tuning (safety limits are in lamp_config.ini) ----------------------------------
 SAMPLE_RATE = 44100
 CHUNK = 2048                 # samples per analysis window (~46 ms)
-MAX_SEND_HZ = 8.0            # lamp update rate ceiling (measured safe range: ~9-20/s)
-MIN_BRIGHTNESS = 0.08        # keeps the lamp from going fully dark between beats
+MIN_BRIGHTNESS = 0.08        # keeps the lamp from going fully dark between beats (fraction of the cap)
 HUE_RANGE = (0.60, 0.00)     # low-pitched sound -> blue (0.60), bright sound -> red (0.0)
 SMOOTH_HUE = 0.15            # 0..1, higher = faster color changes
 SMOOTH_LEVEL_UP = 0.6        # fast attack
 SMOOTH_LEVEL_DOWN = 0.15     # slower release
+GENTLE_LEVEL_UP = 0.25       # gentle mode: slower attack ...
+GENTLE_LEVEL_DOWN = 0.06     # ... and release
 BEAT_HUE_STEP = 0.14         # hue jump per detected beat (0.14 ~ 50 degrees round the wheel)
 BEAT_SENSITIVITY = 1.3       # bass must exceed its recent average by this factor (lower = more beats)
-BEAT_MIN_GAP = 0.25          # seconds between beats (caps detection at 240 bpm)
 BEAT_DRIFT = 0.0015          # slow hue drift per audio chunk, scaled by loudness
-BEAT_BRIGHTNESS_FLOOR = 0.55 # in beats mode the lamp stays at least this bright
-BLINK_DIP_MS = 70            # how long the lamp sits at ~1% (near dark) before the new color rises
-BLINK_RISE_MS = 130          # how long the new color takes to come up to full
+BEAT_BRIGHTNESS_FLOOR = 0.55 # in beats mode the lamp stays at least this bright (fraction of the cap)
+BLINK_DIP_MS = 70            # how long the lamp sits at the dip brightness before the new color rises
+BLINK_RISE_MS = 130          # how long the new color takes to come up
 POLL_SECONDS = 0.01          # main loop poll, so a beat is acted on within ~10 ms
 SILENCE_RMS = 1e-4
 SILENCE_STOP_MIN = 10        # quit after this many minutes of continuous silence
-MAX_CONSECUTIVE_LAMP_ERRORS = 5
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------
 
 
 class AlreadyRunning(Exception):
@@ -113,19 +119,25 @@ def release_lock():
 class Config:
     """Settings the Engine reads live, so the window can change them while running."""
     mode: str = "beats"            # "beats" | "classic"
-    blink: str = "none"            # "none" | "every" | "alternate"  (beats mode only)
-    minutes: float = 120.0         # hard runtime cap
+    blink: str = "none"            # "none" | "every" | "alternate"  (beats mode, opt-in, not in gentle)
+    minutes: Optional[float] = None  # runtime cap; None = max_runtime_minutes from lamp_config.ini
     threshold: float = BEAT_SENSITIVITY
     dry_run: bool = False          # analyse audio only, never touch the lamp
+    gentle: bool = False           # slower smoothing, lower brightness/rate, no blinking
+    restore: str = "previous"      # "previous" | "warm"  (what the lamp does on exit)
+    off_at_exit: bool = False      # only way the script ever calls off()
 
 
 class Analyzer(threading.Thread):
     """Reads loopback audio and keeps the latest (level, hue) in shared state."""
 
-    def __init__(self, stop, cfg):
+    def __init__(self, stop, cfg, limits):
         super().__init__(daemon=True)
         self.stop = stop
         self.cfg = cfg
+        self.min_beat_gap = 1 / limits.max_flashes_per_sec   # beat color changes count as flashes
+        self.up, self.down = ((GENTLE_LEVEL_UP, GENTLE_LEVEL_DOWN) if cfg.gentle
+                              else (SMOOTH_LEVEL_UP, SMOOTH_LEVEL_DOWN))
         self.level = 0.0      # 0..1 smoothed loudness, bass-weighted
         self.hue = HUE_RANGE[0]
         self.silent_since = None
@@ -153,7 +165,7 @@ class Analyzer(threading.Thread):
         rms = float(np.sqrt(np.mean(mono ** 2)))
         if rms < SILENCE_RMS:
             self.silent_since = self.silent_since or time.time()
-            self.level += (0 - self.level) * SMOOTH_LEVEL_DOWN
+            self.level += (0 - self.level) * self.down
             return
         self.silent_since = None
 
@@ -166,7 +178,7 @@ class Analyzer(threading.Thread):
         now = time.time()
         self._bass_peak = max(self._bass_peak * 0.999, bass)
         if (bass > self._bass_avg * self.cfg.threshold and bass > 0.25 * self._bass_peak
-                and now - self._last_beat > BEAT_MIN_GAP):
+                and now - self._last_beat > self.min_beat_gap):
             self._last_beat = now
             self.beats += 1
             self.beat_hue = (self.beat_hue + BEAT_HUE_STEP) % 1.0
@@ -177,7 +189,7 @@ class Analyzer(threading.Thread):
         raw = bass * 0.7 + total * 0.3
         self._peak = max(self._peak * 0.999, raw)
         target = min(1.0, raw / self._peak)
-        k = SMOOTH_LEVEL_UP if target > self.level else SMOOTH_LEVEL_DOWN
+        k = self.up if target > self.level else self.down
         self.level += (target - self.level) * k
 
         # hue: spectral centroid on a log scale (200 Hz .. 4 kHz)
@@ -188,42 +200,32 @@ class Analyzer(threading.Thread):
         self.hue += (target_hue - self.hue) * SMOOTH_HUE
 
 
-def snapshot(lamp):
-    s = lamp.status()
-    return {"on": s.is_on, "mode": s.color_mode, "rgb": s.rgb, "ct": s.color_temp, "bri": s.brightness}
-
-
-def restore(lamp, snap, log):
-    try:
-        if not snap["on"]:
-            lamp.off()
-            return
-        lamp.on()
-        if snap["mode"] == 2 and snap["ct"]:
-            lamp.set_color_temp(snap["ct"])
-        elif snap["rgb"]:
-            lamp.set_rgb(tuple(snap["rgb"]))
-        else:
-            lamp.set_color_temp(3000)
-        lamp.set_brightness(snap["bri"])
-        log("Lamp restored to its previous state.")
-    except Exception as e:  # noqa: BLE001
-        log(f"Could not restore lamp ({e}). Set it from Mi Home if needed.")
-
-
 class Engine:
-    """Runs one music-sync session on a background thread. Create a new Engine per session."""
+    """Runs one music-sync session on a background thread. Create a new Engine per session.
 
-    def __init__(self, ip, token, cfg, log=print):
+    `raw_factory` / `analyzer_factory` exist so tests can substitute a fake lamp and fake audio.
+    """
+
+    def __init__(self, ip, token, cfg, log=print, limits=None, raw_factory=None, analyzer_factory=None):
         self.ip, self.token, self.cfg, self.log = ip, token, cfg, log
+        self.limits = limits or ls.load_limits()
+        if cfg.gentle:
+            self.limits = self.limits.gentle()
+        self.raw_factory = raw_factory or self._default_raw
+        self.analyzer_factory = analyzer_factory or (lambda stop: Analyzer(stop, self.cfg, self.limits))
         self.stop_event = threading.Event()
         self.thread = None
         self.analyzer = None
+        self.lamp = None
         self.running = False
         self.finish_reason = None   # set when the session ends
         # live status for the UI
         self.level, self.beats, self.blinks, self.rgb = 0.0, 0, 0, (0, 0, 0)
         self.device_name = ""
+
+    def _default_raw(self):
+        from miio import Yeelight
+        return Yeelight(self.ip, self.token)
 
     def start(self):
         acquire_lock()  # raises AlreadyRunning
@@ -231,51 +233,55 @@ class Engine:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def stop(self, timeout=10):
+    def stop(self, timeout=15):
         """Ask the session to end and wait until the lamp has been restored."""
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout)
 
     def _run(self):
-        lamp = snap = None
         reason = "stopped"
         try:
+            self.log(ls.PHOTOSENSITIVITY_NOTICE)
+            self.log(f"Limits: {self.limits.describe()}" + (" (gentle mode)" if self.cfg.gentle else ""))
             if not self.cfg.dry_run:
-                from miio import Yeelight
                 self.log(f"Connecting to lamp at {self.ip} ...")
-                lamp = Yeelight(self.ip, self.token)
-                snap = snapshot(lamp)
-                lamp.on()
-                lamp.set_brightness(100)
+                self.lamp = ls.SafeLamp(self.raw_factory(), self.limits, log=self.log)
+                self.lamp.start_session()
 
-            self.analyzer = Analyzer(self.stop_event, self.cfg)
+            self.analyzer = self.analyzer_factory(self.stop_event)
             self.analyzer.start()
             self.device_name = self.analyzer.device.name
             self.log(f"Capturing: {self.device_name}")
-            reason = self._loop(lamp)
-        except Exception as e:  # noqa: BLE001
-            reason = f"error: {e}"
+            reason = self._loop()
+        except BaseException as e:  # noqa: BLE001 - incl. KeyboardInterrupt: always fall through to restore
+            reason = "interrupted" if isinstance(e, KeyboardInterrupt) else f"error: {e}"
         finally:
             self.stop_event.set()
-            if lamp and snap:
-                restore(lamp, snap, self.log)
+            if self.lamp:
+                self.lamp.finish(self.cfg.restore, self.cfg.off_at_exit)
             release_lock()
             self.finish_reason = reason
             self.running = False
             self.log(f"Stopped ({reason}).")
 
-    def _loop(self, lamp):
-        an, cfg = self.analyzer, self.cfg
-        deadline = time.time() + cfg.minutes * 60
-        interval = 1 / MAX_SEND_HZ
-        errors, last_send, hold_until, seen_beats = 0, 0.0, 0.0, 0
+    def _loop(self):
+        an, cfg, lamp, lim = self.analyzer, self.cfg, self.lamp, self.limits
+        minutes = cfg.minutes or lim.max_runtime_minutes
+        deadline = time.time() + minutes * 60
+        interval = 1 / lim.max_updates_per_sec
+        step = lim.brightness_step / 100
+        last_send, hold_until, seen_beats, last_v = 0.0, 0.0, 0, None
+        blink_allowed = cfg.mode == "beats" and cfg.blink != "none" and not cfg.gentle
+        cap = lim.max_brightness / 100
         while not self.stop_event.is_set():
             t0 = time.time()
             if t0 >= deadline:
                 return "runtime cap reached"
             if an.error:
                 return f"audio capture failed: {an.error}"
+            if lamp and lamp.failed:
+                return lamp.failed
             if an.silent_since and t0 - an.silent_since > SILENCE_STOP_MIN * 60:
                 return f"no audio for {SILENCE_STOP_MIN} min"
 
@@ -286,34 +292,33 @@ class Engine:
             else:
                 v = MIN_BRIGHTNESS + (1 - MIN_BRIGHTNESS) * an.level
                 hue = an.hue
-            r, g, b = (int(c * 255) for c in colorsys.hsv_to_rgb(hue % 1.0, 1.0, v))
-            r = max(r, 1)
-            self.level, self.beats, self.rgb = an.level, an.beats, (r, g, b)
+            self.level, self.beats = an.level, an.beats
 
-            # a new beat that should blink: dip the lamp to ~dark and rise in the new color
-            # with ONE on-device flow command, so there are no extra network round trips.
             new_beat = an.beats != seen_beats
             seen_beats = an.beats
-            blink = (new_beat and cfg.mode == "beats" and cfg.blink != "none"
+            blink = (new_beat and blink_allowed
                      and (cfg.blink == "every" or an.beats % 2 == 0))
 
-            if blink or (t0 - last_send >= interval and t0 >= hold_until):
-                last_send = t0
-                if blink:
+            if blink:
+                # blink: dip to the dip brightness and rise in the new color. The dip is the one
+                # explicit exception to the brightness-step rule; it is opt-in and rate limited.
+                r, g, b = (max(int(c * 255), 1) for c in colorsys.hsv_to_rgb(hue % 1.0, 1.0, v))
+                self.rgb = (r, g, b)
+                if lamp is None or lamp.submit_blink((r, g, b), BLINK_DIP_MS, BLINK_RISE_MS):
                     self.blinks += 1
+                    hold_until = t0 + (BLINK_DIP_MS + BLINK_RISE_MS) / 1000 + 0.05
+                    last_send = t0
+                    last_v = v
+            elif t0 - last_send >= interval and t0 >= hold_until:
+                last_send = t0
+                if last_v is not None:   # no instant full-range jumps
+                    v = last_v + max(-step / cap, min(step / cap, v - last_v))
+                last_v = v
+                r, g, b = (int(c * 255) for c in colorsys.hsv_to_rgb(hue % 1.0, 1.0, v))
+                r = max(r, 1)
+                self.rgb = (r, g, b)
                 if lamp:
-                    try:
-                        if blink:
-                            c = (r << 16) | (g << 8) | b
-                            lamp.raw_command("start_cf", [2, 1, f"{BLINK_DIP_MS},1,{c},1,{BLINK_RISE_MS},1,{c},100"])
-                            hold_until = t0 + (BLINK_DIP_MS + BLINK_RISE_MS) / 1000 + 0.05
-                        else:
-                            lamp.set_rgb((r, g, b))
-                        errors = 0
-                    except Exception as e:  # noqa: BLE001
-                        errors += 1
-                        if errors >= MAX_CONSECUTIVE_LAMP_ERRORS:
-                            return f"lamp unreachable ({e})"
+                    lamp.submit_color((r, g, b))
             time.sleep(POLL_SECONDS)
         return "stopped"
 
@@ -326,26 +331,57 @@ def quit_pressed():
     return False
 
 
+def _install_exit_handlers(engine):
+    """Restore the lamp when the console is closed or the process is terminated."""
+    def _terminate(*_):
+        raise KeyboardInterrupt
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _terminate)
+    try:
+        import ctypes
+        handler_t = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+        def _on_console_event(event):
+            if event in (2, 5, 6):  # CLOSE, LOGOFF, SHUTDOWN
+                engine.stop()
+            return 0
+        engine._ctrl_handler = handler_t(_on_console_event)  # keep a reference
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(engine._ctrl_handler, True)
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--minutes", type=float, default=120, help="hard runtime cap (default 120)")
+    ap.add_argument("--max-runtime", "--minutes", dest="minutes", type=float, default=None,
+                    help="hard runtime cap in minutes (default: max_runtime_minutes in lamp_config.ini, 120)")
     ap.add_argument("--mode", choices=["beats", "classic"], default="beats",
                     help="beats: color steps on each beat (default); classic: bass->brightness, pitch->hue")
     ap.add_argument("--blink", choices=["none", "every", "alternate"], default="none",
-                    help="beats mode only: dip the lamp to dark on every beat / every other beat, "
-                         "then bring the new color up (default none)")
+                    help="OPT-IN, beats mode only, ignored in --gentle: dip the lamp to dark on every beat / "
+                         "every other beat, then bring the new color up (default none)")
+    ap.add_argument("--gentle", action="store_true",
+                    help="slower smoothing, lower brightness cap and update rate, no blinking")
+    ap.add_argument("--restore", choices=["previous", "warm"], default="previous",
+                    help="on exit: put the lamp back as it was (default) or set warm white")
+    ap.add_argument("--off-at-exit", action="store_true",
+                    help="turn the lamp off when the script ends (default: leave it on)")
     ap.add_argument("--dry-run", action="store_true", help="analyse audio only, never send to lamp")
     args = ap.parse_args()
 
+    ls.ensure_config_file()
     env = load_env()
-    cfg = Config(mode=args.mode, blink=args.blink, minutes=args.minutes, dry_run=args.dry_run)
+    cfg = Config(mode=args.mode, blink=args.blink, minutes=args.minutes, dry_run=args.dry_run,
+                 gentle=args.gentle, restore=args.restore, off_at_exit=args.off_at_exit)
     engine = Engine(env.get("LAMP_IP", ""), env.get("LAMP_TOKEN", ""), cfg)
     try:
         engine.start()
     except AlreadyRunning as e:
         sys.exit(str(e))
+    _install_exit_handlers(engine)
 
-    print(f"Running (max {args.minutes:g} min). Press q or Esc to quit, or Ctrl+C.")
+    print("Press q or Esc to quit, or Ctrl+C.")
     last_print = 0.0
     try:
         while engine.running:

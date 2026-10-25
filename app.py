@@ -1,16 +1,20 @@
 """
 Mi Lamp Sync - window app. Click Start to sync the lamp with the music on this PC, Stop (or close
 the window) to end it and put the lamp back as it was. Nothing runs until you click Start.
+Safety limits (brightness cap, update and flash rates, ...) are in lamp_config.ini.
 """
 import json
 import os
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import lamp_safety as ls
 import music_sync as ms
 
 SETTINGS_PATH = os.path.join(ms.HERE, "settings.json")
-DEFAULTS = {"mode": "beats", "blink": "none", "minutes": 120, "sensitivity": 0.83}
+DEFAULTS = {"mode": "beats", "blink": "none", "minutes": 120, "sensitivity": 0.83,
+            "gentle": False, "restore": "previous"}
+RESTORE_LABELS = {"Previous state": "previous", "Warm white": "warm"}
 
 
 def threshold_from_slider(s):
@@ -24,6 +28,8 @@ class App(tk.Tk):
         self.title("Mi Lamp Sync")
         self.resizable(False, False)
         self.engine = None
+        ls.ensure_config_file()
+        self.limits = ls.load_limits()
         self.settings = dict(DEFAULTS)
         try:
             with open(SETTINGS_PATH) as f:
@@ -53,37 +59,62 @@ class App(tk.Tk):
 
         ttk.Label(frm, text="Blink on beat").grid(row=4, column=0, sticky="w", **pad)
         self.blink = tk.StringVar(value=self.settings["blink"])
-        ttk.Combobox(frm, textvariable=self.blink, values=["none", "every", "alternate"], state="readonly",
-                     width=12).grid(row=4, column=1, sticky="w", **pad)
+        self.blink_box = ttk.Combobox(frm, textvariable=self.blink, values=["none", "every", "alternate"],
+                                      state="readonly", width=12)
+        self.blink_box.grid(row=4, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Beat sensitivity").grid(row=5, column=0, sticky="w", **pad)
+        self.gentle = tk.BooleanVar(value=bool(self.settings["gentle"]))
+        ttk.Checkbutton(frm, text="Gentle mode (slower, dimmer, no blinking)", variable=self.gentle,
+                        command=self._gentle_changed).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+
+        ttk.Label(frm, text="Beat sensitivity").grid(row=6, column=0, sticky="w", **pad)
         self.sens = tk.DoubleVar(value=self.settings["sensitivity"])
         ttk.Scale(frm, from_=0, to=1, variable=self.sens, length=190,
-                  command=lambda _=None: self._push_live()).grid(row=5, column=1, sticky="w", **pad)
+                  command=lambda _=None: self._push_live()).grid(row=6, column=1, sticky="w", **pad)
 
-        ttk.Label(frm, text="Auto-stop after (min)").grid(row=6, column=0, sticky="w", **pad)
+        ttk.Label(frm, text="Auto-stop after (min)").grid(row=7, column=0, sticky="w", **pad)
         self.minutes = tk.StringVar(value=str(self.settings["minutes"]))
-        ttk.Spinbox(frm, from_=1, to=600, textvariable=self.minutes, width=8).grid(row=6, column=1, sticky="w", **pad)
+        ttk.Spinbox(frm, from_=1, to=int(self.limits.max_runtime_minutes), textvariable=self.minutes,
+                    width=8).grid(row=7, column=1, sticky="w", **pad)
+
+        ttk.Label(frm, text="When stopped").grid(row=8, column=0, sticky="w", **pad)
+        current = next((k for k, v in RESTORE_LABELS.items() if v == self.settings["restore"]), "Previous state")
+        self.restore = tk.StringVar(value=current)
+        ttk.Combobox(frm, textvariable=self.restore, values=list(RESTORE_LABELS), state="readonly",
+                     width=14).grid(row=8, column=1, sticky="w", **pad)
 
         self.preview = tk.BooleanVar(value=False)
         ttk.Checkbutton(frm, text="Preview only (don't control the lamp)", variable=self.preview).grid(
-            row=7, column=0, columnspan=2, sticky="w", **pad)
+            row=9, column=0, columnspan=2, sticky="w", **pad)
 
         self.button = ttk.Button(frm, text="Start", command=self.toggle, width=18)
-        self.button.grid(row=8, column=0, columnspan=2, pady=(10, 4))
+        self.button.grid(row=10, column=0, columnspan=2, pady=(10, 4))
 
         self.swatch = tk.Canvas(frm, width=300, height=34, highlightthickness=1, highlightbackground="#888",
                                 bg="#222")
-        self.swatch.grid(row=9, column=0, columnspan=2, pady=4)
+        self.swatch.grid(row=11, column=0, columnspan=2, pady=4)
 
         self.status = tk.StringVar(value="Idle. Click Start to begin.")
-        ttk.Label(frm, textvariable=self.status, wraplength=320, justify="left").grid(
-            row=10, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(frm, textvariable=self.status, wraplength=330, justify="left").grid(
+            row=12, column=0, columnspan=2, sticky="w", **pad)
 
+        ttk.Label(frm, text=f"Limits: {self.limits.describe()}", wraplength=330, justify="left",
+                  foreground="#666").grid(row=13, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(frm, text=ls.PHOTOSENSITIVITY_NOTICE, wraplength=330, justify="left",
+                  foreground="#a05a00").grid(row=14, column=0, columnspan=2, sticky="w", **pad)
+
+        self._gentle_changed()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self.tick)
 
     # -- settings --------------------------------------------------------------------------------
+    def _gentle_changed(self):
+        if self.gentle.get():
+            self.blink.set("none")
+            self.blink_box.config(state="disabled")
+        else:
+            self.blink_box.config(state="readonly")
+
     def _push_live(self):
         if self.engine:
             self.engine.cfg.threshold = threshold_from_slider(self.sens.get())
@@ -93,13 +124,14 @@ class App(tk.Tk):
             ms.save_env(self.ip.get().strip(), self.token.get().strip())
         with open(SETTINGS_PATH, "w") as f:
             json.dump({"mode": self.mode.get(), "blink": self.blink.get(),
-                       "minutes": self._minutes(), "sensitivity": round(self.sens.get(), 2)}, f)
+                       "minutes": self._minutes(), "sensitivity": round(self.sens.get(), 2),
+                       "gentle": self.gentle.get(), "restore": RESTORE_LABELS[self.restore.get()]}, f)
 
     def _minutes(self):
         try:
-            return max(1.0, min(600.0, float(self.minutes.get())))
+            return max(1.0, min(self.limits.max_runtime_minutes, float(self.minutes.get())))
         except ValueError:
-            return 120.0
+            return self.limits.max_runtime_minutes
 
     # -- start / stop ----------------------------------------------------------------------------
     def toggle(self):
@@ -114,8 +146,10 @@ class App(tk.Tk):
             return
         self._save()
         cfg = ms.Config(mode=self.mode.get(), blink=self.blink.get(), minutes=self._minutes(),
-                        threshold=threshold_from_slider(self.sens.get()), dry_run=self.preview.get())
-        self.engine = ms.Engine(self.ip.get().strip(), self.token.get().strip(), cfg, log=self._log)
+                        threshold=threshold_from_slider(self.sens.get()), dry_run=self.preview.get(),
+                        gentle=self.gentle.get(), restore=RESTORE_LABELS[self.restore.get()])
+        self.engine = ms.Engine(self.ip.get().strip(), self.token.get().strip(), cfg, log=self._log,
+                                limits=self.limits)
         try:
             self.engine.start()
         except ms.AlreadyRunning as e:

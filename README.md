@@ -21,17 +21,37 @@ miIO protocol ([python-miio](https://github.com/rytilahti/python-miio)).
 - Loopback only *reads* the output signal. It doesn't change your volume, device or playback.
 - The lamp accepts roughly 8-20 commands a second over Wi-Fi, so color changes can trail the beat
   by around 100-150 ms. It feels rhythmic, but it isn't frame-accurate.
-- The "dark" part of a blink is a dip to about 1% brightness, not a true power-off. This lamp ignores
-  color changes while powered off, and a dip can be sent as a single command.
+- The "dark" part of a blink is a dip to 5% brightness, not a power-off. The app never toggles the
+  lamp's power for effects (and this lamp ignores color changes while powered off anyway).
 
 ## Safety and guardrails
 
-- **Runs only when you start it.** No background service, no autostart, no scheduled task.
-- **Stop any time:** the Stop button, closing the window, or `q`/`Esc`/`Ctrl+C` in the CLI.
-- **The lamp is restored** to its previous power, color/temperature and brightness whenever a session ends.
-- **Hard runtime cap** (default 120 min), auto-stop after 10 min of silence, and auto-stop after 5
-  failed lamp commands in a row.
-- **One instance at a time** (lock file).
+> **Photosensitivity warning.** Rapid flashing can be uncomfortable or unsafe for people with
+> photosensitivity. Use gentle mode and moderate brightness near bed. Blink-on-beat is **off by default**.
+
+All lamp commands go through one safety layer (`lamp_safety.py`), so these limits can't be bypassed
+by accident. They're configurable in `lamp_config.ini` (see below):
+
+- **Brightness cap: 80%**, always, applied to every brightness value. Near-white colors (all channels
+  high) are scaled down, since sustained full-power white produces the most heat.
+- **Rate limit:** at most `max_updates_per_sec` commands per second (default 4, set to about 70% of
+  your lamp's measured rate after the speed test). Newer commands replace older pending ones; nothing
+  is queued. If the lamp stops answering, the rate is halved on each failure and the session ends after
+  5 failures in a row, with a hint to check the lamp's IP.
+- **Flash limit:** at most 3 beat color changes or blinks per second. Brightness changes between
+  updates are capped at 25 points; the blink dip is the one opt-in exception.
+- **Power:** the lamp's power is never toggled for effects, and the lamp is **left on** when a session
+  ends. It's only turned off if you pass `--off-at-exit`.
+- **Saved state:** while a session runs, "save state on change" is switched **off** on the lamp, so the
+  lamp's saved default isn't rewritten on every color change. It is not switched back on afterwards
+  (re-enable it from Python with `Yeelight(ip, token).set_save_state_on_change(True)` if you want).
+- **Restore on exit:** quit, `Ctrl+C`, an error, closing the window or the console, or the time limit
+  all put the lamp back to its previous color/temperature and brightness (or warm white with
+  `--restore warm`). Restored brightness is also capped at 80%.
+- **Gentle mode** (`--gentle` / checkbox): slower smoothing, a 50% brightness ceiling, half the update
+  rate, fewer flashes, and no blinking.
+- **Runs only when you start it.** No background service, no autostart, no scheduled task. One instance
+  at a time (lock file), a hard runtime cap (default 120 min), auto-stop after 10 min of silence.
 
 ## Requirements
 
@@ -87,8 +107,10 @@ warning about it.
 3. Pick a style and blink option, start some music and click **Start**.
 4. Click **Stop** (or close the window) to end it and restore the lamp.
 
-Options: **Style** (beats or classic), **Blink on beat** (none, every, alternate), **Beat sensitivity**
-(works live), **Auto-stop after (min)**, and **Preview only** (analyse audio without touching the lamp).
+Options: **Style** (beats or classic), **Blink on beat** (none by default; every or alternate beat),
+**Gentle mode**, **Beat sensitivity** (works live), **Auto-stop after (min)**, **When stopped**
+(restore the previous state or set warm white) and **Preview only** (analyse audio without touching
+the lamp).
 
 ### Command line
 
@@ -96,23 +118,42 @@ Options: **Style** (beats or classic), **Blink on beat** (none, every, alternate
 copy .env.example .env      # then edit .env with your IP and token
 
 python lamp_test.py test           # sanity check: red -> green -> blue -> warm white
-python lamp_test.py speed          # measure how many commands/sec your lamp accepts
+python lamp_test.py speed          # measure commands/sec and record a safe rate in lamp_config.ini
 
 python music_sync.py                          # beats style, up to 120 min
-python music_sync.py --blink every            # dip to dark on every beat
+python music_sync.py --gentle                 # slower, dimmer, no blinking
+python music_sync.py --blink every            # opt-in: dip to 5% on every beat
 python music_sync.py --blink alternate        # ...on every other beat
 python music_sync.py --mode classic           # bass -> brightness, pitch -> hue
-python music_sync.py --minutes 30             # custom time limit
+python music_sync.py --max-runtime 30         # custom time limit (minutes)
+python music_sync.py --restore warm           # finish on warm white instead of the previous state
+python music_sync.py --off-at-exit            # turn the lamp off when done (default: leave it on)
 python music_sync.py --dry-run                # analyse audio only, never touch the lamp
 ```
 
 Press `q`, `Esc` or `Ctrl+C` to quit.
 
-## Tuning
+## Configuration and tuning
 
-Tunable constants are at the top of `music_sync.py`: the hue step per beat (`BEAT_HUE_STEP`),
-beat sensitivity (`BEAT_SENSITIVITY`), minimum gap between beats (`BEAT_MIN_GAP`), brightness floor,
-blink timing (`BLINK_DIP_MS`, `BLINK_RISE_MS`), and the safety limits.
+- **Safety limits** are in `lamp_config.ini` (created from `lamp_config.example.ini` on first run;
+  every setting is commented). Values are clamped to safe ranges, for example the flash limit can't
+  exceed 3 per second. Run `python lamp_test.py speed` once: it records your lamp's measured rate in the
+  file and sets the update limit to about 70% of it.
+- **Look and feel** constants are at the top of `music_sync.py`: the hue step per beat
+  (`BEAT_HUE_STEP`), beat sensitivity, smoothing, blink timing (`BLINK_DIP_MS`, `BLINK_RISE_MS`).
+
+## Tests
+
+The safety rules have automated tests that use a fake lamp and fake audio (no hardware needed):
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+They check, among other things, that brightness never exceeds the cap, that a burst of commands is
+rate limited with the latest value winning, that `off()` is only called with the explicit flag, that
+the lamp is restored on `Ctrl+C`, errors and the runtime cap, and that no token appears in tracked
+files or logs.
 
 ## Troubleshooting
 
@@ -133,6 +174,8 @@ python -m PyInstaller --noconfirm --onefile --windowed --name MiLampSync --colle
 ```
 
 The result is `dist\MiLampSync.exe`. Put your `.env` next to it (or enter the IP/token in the app).
+`lamp_config.ini` is created next to the `.exe` on first run; run the speed test from source
+(`python lamp_test.py speed`) and copy the resulting file over if you want a measured rate.
 
 ## Limitations
 
